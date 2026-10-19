@@ -1,3 +1,3 @@
 ## Branching Strategy
 
-this commit is from main
+this commit is to develop
