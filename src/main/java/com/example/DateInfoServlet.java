@@ -17,6 +17,9 @@ public class DateInfoServlet extends HttpServlet {
         String sign = "";
 
         switch (month) {
+            case JANUARY-FEBRUARY:
+                sign = (day <= 19) ? "Capricorn" : "Aquarius";
+                break;
             case JANUARY:
                 sign = (day <= 19) ? "Capricorn" : "Aquarius";
                 break;
