@@ -39,6 +39,11 @@ on:
         required: false
         type: string
         default: ''
+      merge_mainline_parent:
+        description: 'Parent number to use with -m when a given SHA is a merge commit (1 = the branch it was merged into -- correct for a normal "git merge feature" commit on develop)'
+        required: false
+        type: string
+        default: '1'
 
 permissions:
   contents: write
@@ -108,13 +113,28 @@ jobs:
             fi
           done
 
+          MAINLINE="${{ inputs.merge_mainline_parent }}"
+
           echo "Cherry-picking in order:"
           echo "$SHAS"
           for SHA in $SHAS; do
-            echo "--- Cherry-picking $SHA ---"
-            if ! git cherry-pick -x "$SHA"; then
+            PARENT_COUNT=$(git rev-list --parents -n 1 "$SHA" | wc -w)
+            PARENT_COUNT=$((PARENT_COUNT - 1))
+
+            if [ "$PARENT_COUNT" -gt 1 ]; then
+              echo "--- Cherry-picking $SHA (merge commit with $PARENT_COUNT parents, using -m $MAINLINE) ---"
+              echo "- \`$SHA\` is a merge commit -- cherry-picked with \`-m $MAINLINE\`. Double-check this is the intended side if develop's merge strategy is unusual." >> "$GITHUB_STEP_SUMMARY"
+              PICK_OK=true
+              git cherry-pick -x -m "$MAINLINE" "$SHA" || PICK_OK=false
+            else
+              echo "--- Cherry-picking $SHA ---"
+              PICK_OK=true
+              git cherry-pick -x "$SHA" || PICK_OK=false
+            fi
+
+            if [ "$PICK_OK" = false ]; then
               echo "::error::Cherry-pick conflict on $SHA."
-              git cherry-pick --abort || true
+              git cherry-pick --abort 2>/dev/null || true
               echo "conflict_sha=$SHA" >> "$GITHUB_OUTPUT"
               exit 1
             fi
@@ -129,7 +149,7 @@ jobs:
         if: failure() && steps.cherrypick.outputs.conflict_sha != ''
         run: |
           echo "::error::Pushed '${{ steps.compose.outputs.compose_branch }}' with every cherry-pick that succeeded before ${{ steps.cherrypick.outputs.conflict_sha }}."
-          echo "::error::Pull that branch locally, resolve the conflict on ${{ steps.cherrypick.outputs.conflict_sha }}, cherry-pick --continue, push, then open the PR to ${{ inputs.release_branch }} by hand (or re-run this workflow with only the remaining SHAs against the same release_branch)."
+          echo "::error::Pull that branch locally, resolve the conflict on ${{ steps.cherrypick.outputs.conflict_sha }} (add -m ${{ inputs.merge_mainline_parent }} to your cherry-pick if that SHA is a merge commit), cherry-pick --continue, push, then open the PR to ${{ inputs.release_branch }} by hand (or re-run this workflow with only the remaining SHAs against the same release_branch)."
           exit 1
 
       - name: Build PR body
