@@ -1,0 +1,169 @@
+name: Compose Release Branch
+
+# Place this file at .github/workflows/compose-release-branch.yml
+#
+# Purpose: given a release branch name and a list of approved feature commit
+# SHAs (e.g. the squash-merge commits for feature 1.1 and 1.5 on develop),
+# this workflow:
+#   1. Creates the release branch from base_branch if it doesn't exist yet
+#   2. Cherry-picks the given commits, in order, onto a fresh "compose" branch
+#   3. Opens a PR from the compose branch into the release branch for review
+#
+# It never pushes cherry-picks directly to the release branch -- composing
+# always goes through a reviewable PR, consistent with the branch protection
+# rules on release/*.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: 'Release branch to create/target (e.g. release/2026-11-R1)'
+        required: true
+        type: string
+      base_branch:
+        description: 'Branch to cut the release branch from if it does not already exist'
+        required: false
+        type: string
+        default: 'main'
+      commit_shas:
+        description: 'Approved commit SHAs to cherry-pick, in order, separated by commas or newlines (e.g. abc1234,def5678)'
+        required: true
+        type: string
+      pr_title:
+        description: 'Title for the compose PR (optional -- a sensible default is generated if left blank)'
+        required: false
+        type: string
+        default: ''
+      reviewers:
+        description: 'Comma-separated GitHub usernames to request review from (optional)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  compose-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+      - name: Fetch base and release branches
+        run: |
+          git fetch origin "${{ inputs.base_branch }}"
+          git fetch origin "${{ inputs.release_branch }}" || echo "Release branch does not exist yet -- will be created."
+
+      - name: Create release branch if it does not already exist
+        run: |
+          set -euo pipefail
+          RELEASE_BRANCH="${{ inputs.release_branch }}"
+          BASE_BRANCH="${{ inputs.base_branch }}"
+
+          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
+            echo "Release branch '$RELEASE_BRANCH' already exists -- composing onto it."
+            git checkout -B "$RELEASE_BRANCH" "origin/$RELEASE_BRANCH"
+          else
+            echo "Release branch '$RELEASE_BRANCH' does not exist -- cutting it from '$BASE_BRANCH'."
+            git checkout -B "$RELEASE_BRANCH" "origin/$BASE_BRANCH"
+            git push origin "$RELEASE_BRANCH"
+          fi
+
+      - name: Create compose branch
+        id: compose
+        run: |
+          set -euo pipefail
+          SAFE_NAME=$(echo "${{ inputs.release_branch }}" | tr '/' '-')
+          COMPOSE_BRANCH="compose/${SAFE_NAME}-${{ github.run_id }}"
+          git checkout -b "$COMPOSE_BRANCH"
+          echo "compose_branch=$COMPOSE_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Validate and cherry-pick approved commits
+        id: cherrypick
+        run: |
+          set -euo pipefail
+          RAW_SHAS="${{ inputs.commit_shas }}"
+          SHAS=$(echo "$RAW_SHAS" | tr ',' '\n' | tr -s ' \t\r' '\n' | sed '/^$/d')
+
+          if [ -z "$SHAS" ]; then
+            echo "::error::No commit SHAs provided."
+            exit 1
+          fi
+
+          echo "Validating all commit SHAs exist before picking any of them ..."
+          for SHA in $SHAS; do
+            if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+              echo "::error::Commit $SHA was not found in this repository's history."
+              exit 1
+            fi
+          done
+
+          echo "Cherry-picking in order:"
+          echo "$SHAS"
+          for SHA in $SHAS; do
+            echo "--- Cherry-picking $SHA ---"
+            if ! git cherry-pick -x "$SHA"; then
+              echo "::error::Cherry-pick conflict on $SHA."
+              git cherry-pick --abort || true
+              echo "conflict_sha=$SHA" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+
+      - name: Push compose branch (runs even if a cherry-pick above failed)
+        if: always()
+        run: |
+          git push origin "${{ steps.compose.outputs.compose_branch }}" --force-with-lease
+
+      - name: Explain how to resolve a cherry-pick conflict
+        if: failure() && steps.cherrypick.outputs.conflict_sha != ''
+        run: |
+          echo "::error::Pushed '${{ steps.compose.outputs.compose_branch }}' with every cherry-pick that succeeded before ${{ steps.cherrypick.outputs.conflict_sha }}."
+          echo "::error::Pull that branch locally, resolve the conflict on ${{ steps.cherrypick.outputs.conflict_sha }}, cherry-pick --continue, push, then open the PR to ${{ inputs.release_branch }} by hand (or re-run this workflow with only the remaining SHAs against the same release_branch)."
+          exit 1
+
+      - name: Build PR body
+        if: success()
+        run: |
+          {
+            echo "Composed release branch \`${{ inputs.release_branch }}\` from the following approved commits, in order:"
+            echo ""
+            echo "${{ inputs.commit_shas }}" | tr ',' '\n' | sed '/^$/d; s/^/- /'
+            echo ""
+            echo "Opened automatically by the Compose Release Branch workflow."
+            echo ""
+            echo "**Before approving:** check whether any of these commits touch metadata (profiles, permission sets, flows) also modified by a feature that was held back this cycle -- a clean cherry-pick does not guarantee a semantically correct merge on shared Salesforce metadata."
+          } > pr_body.md
+
+      - name: Open PR into the release branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="${{ inputs.pr_title }}"
+          if [ -z "$TITLE" ]; then
+            TITLE="Compose ${{ inputs.release_branch }}"
+          fi
+
+          REVIEWER_ARGS=()
+          if [ -n "${{ inputs.reviewers }}" ]; then
+            REVIEWER_ARGS=(--reviewer "${{ inputs.reviewers }}")
+          fi
+
+          gh pr create \
+            --base "${{ inputs.release_branch }}" \
+            --head "${{ steps.compose.outputs.compose_branch }}" \
+            --title "$TITLE" \
+            --body-file pr_body.md \
+            "${REVIEWER_ARGS[@]}"
